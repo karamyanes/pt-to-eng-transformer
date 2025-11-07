@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 import os
 from pathlib import Path
 
@@ -17,16 +16,16 @@ from transformers import (
 )
 
 import torch
-
-# we will ALWAYS use nltk in the fallback
 from nltk.translate.bleu_score import corpus_bleu
 
-# if your env needs a HF token, put it here:
 HF_TOKEN = None  # e.g. "hf_XXXXXXXXXXXXXXXXXXXXX"
+
+# === NLLB CHANGE: language codes ===
+SRC_LANG = "por_Latn"
+TGT_LANG = "eng_Latn"
 
 
 def preprocess_translated_sentence(text: str) -> str:
-    """Simple cleaner; replace with your own."""
     return text.strip().lower()
 
 
@@ -84,21 +83,18 @@ def make_preprocess_fn(tokenizer, max_input_length=30, max_target_length=30):
         inputs = [prefix + ex for ex in examples[source_col]]
         targets = [ex for ex in examples[target_col]]
 
+        # For NLLB, tokenizer needs src_lang set at init; no change here.
         model_inputs = tokenizer(
             inputs,
             max_length=max_input_length,
             truncation=True,
         )
 
-        # --- FIX: Replaced deprecated tokenizer.as_target_tokenizer() ---
-        # Tokenize targets explicitly using text_target
         labels = tokenizer(
-            text_target=targets, 
+            text_target=targets,
             max_length=max_target_length,
             truncation=True,
         )
-        # ---------------------------------------------------------------
-        
         model_inputs["labels"] = labels["input_ids"]
         return model_inputs
 
@@ -109,10 +105,8 @@ def make_preprocess_fn(tokenizer, max_input_length=30, max_target_length=30):
 # 3. compute_metrics (fixed)
 # ---------------------------------------------------------------------
 def make_compute_metrics(tokenizer):
-    # we TRY to use HF sacrebleu metric
     try:
-        # Load load_metric inside the function where it is used or import at the top
-        metric = load_metric("sacrebleu") 
+        metric = load_metric("sacrebleu")
         HAS_SACRE_METRIC = True
     except Exception:
         metric = None
@@ -128,32 +122,20 @@ def make_compute_metrics(tokenizer):
         if isinstance(preds, tuple):
             preds = preds[0]
 
-        # decode predictions
         decoded_preds = tokenizer.batch_decode(preds, skip_special_tokens=True)
-
-        # replace -100 with pad_token_id so we can decode labels
         labels = np.where(labels != -100, labels, tokenizer.pad_token_id)
         decoded_labels = tokenizer.batch_decode(labels, skip_special_tokens=True)
-
         decoded_preds, decoded_labels = postprocess_text(decoded_preds, decoded_labels)
 
         if HAS_SACRE_METRIC and metric is not None:
-            # sacrebleu wants: list[str], and references=list[list[str]]
-            result = metric.compute(
-                predictions=decoded_preds,
-                references=decoded_labels,
-            )
+            result = metric.compute(predictions=decoded_preds, references=decoded_labels)
             bleu_score = result["score"]
         else:
-            # STRICT FALLBACK: use NLTK, which wants tokenized refs + hyps
-            # decoded_labels is list[[ref]]  (because of postprocess_text)
-            # we need to de-nest:
             true_refs = [lbl[0] for lbl in decoded_labels]
-            refs_tok = [[r.split()] for r in true_refs]  # list of list-of-refs
+            refs_tok = [[r.split()] for r in true_refs]
             hyps_tok = [p.split() for p in decoded_preds]
             bleu_score = corpus_bleu(refs_tok, hyps_tok) * 100.0
 
-        # length
         prediction_lens = [
             np.count_nonzero(pred != tokenizer.pad_token_id) for pred in preds
         ]
@@ -182,6 +164,9 @@ def translate_and_save_csv(
     src_sents = ds_split["pt"]
     tgt_sents = ds_split["en"]
 
+    # === NLLB CHANGE: ensure tokenizer uses PT as source language ===
+    tokenizer.src_lang = SRC_LANG
+
     enc = tokenizer(
         src_sents,
         return_tensors="pt",
@@ -190,11 +175,15 @@ def translate_and_save_csv(
         max_length=max_input_length,
     )
 
+    # === NLLB CHANGE: force English BOS during generation ===
+    forced_bos = tokenizer.convert_tokens_to_ids(TGT_LANG)
+
     with torch.no_grad():
         generated = model.generate(
             **enc,
             max_length=max_target_length,
             num_beams=4,
+            forced_bos_token_id=forced_bos,
         )
 
     translations = tokenizer.batch_decode(generated, skip_special_tokens=True)
@@ -238,24 +227,32 @@ def main():
     print(ds)
 
     # 2) model + tokenizer
-    model_checkpoint = "Helsinki-NLP/opus-mt-tc-big-en-pt"
+    # === NLLB CHANGE: use NLLB checkpoint ===
+    model_checkpoint = "facebook/nllb-200-distilled-600M"
     print(f"Loading checkpoint: {model_checkpoint}")
 
     if HF_TOKEN:
-        tokenizer = AutoTokenizer.from_pretrained(model_checkpoint, token=HF_TOKEN)
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_checkpoint, token=HF_TOKEN, src_lang=SRC_LANG, tgt_lang=TGT_LANG
+        )
         model = AutoModelForSeq2SeqLM.from_pretrained(model_checkpoint, token=HF_TOKEN)
     else:
-        tokenizer = AutoTokenizer.from_pretrained(model_checkpoint)
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_checkpoint, src_lang=SRC_LANG, tgt_lang=TGT_LANG
+        )
         model = AutoModelForSeq2SeqLM.from_pretrained(model_checkpoint)
+
+    # === NLLB CHANGE: ensure generation defaults to English BOS ===
+    model.config.forced_bos_token_id = tokenizer.convert_tokens_to_ids(TGT_LANG)
 
     # 3) tokenize
     preprocess_fn = make_preprocess_fn(tokenizer)
     print("Tokenizing dataset ...")
     tokenized_ds = ds.map(preprocess_fn, batched=True)
 
-    # 4) training args (old-transformers-friendly)
+    # 4) training args
     batch_size = 16
-    output_dir = "opus-mt-pt-en-finetuned"
+    output_dir = "nllb-pt-en-finetuned"  # === NLLB CHANGE: new dir name
 
     training_args = Seq2SeqTrainingArguments(
         output_dir=output_dir,
@@ -270,8 +267,9 @@ def main():
         logging_steps=50,
         save_steps=500,
         eval_steps=500,
-        # remove this line if your version complains:
-        predict_with_generate=True,
+        predict_with_generate=True,              # enables generate() in eval
+        generation_max_length=30,               # keep aligned with preprocessing
+        generation_num_beams=4,
     )
 
     data_collator = DataCollatorForSeq2Seq(tokenizer, model=model)
